@@ -13,13 +13,26 @@ import { UUPSUpgradeable } from "@openzeppelin/contracts/proxy/utils/UUPSUpgrade
 import { ModeLib } from "@erc7579/lib/ModeLib.sol";
 import { ExecutionHelper } from "@erc7579/core/ExecutionHelper.sol";
 
+import { IERC7821 } from "../src/interfaces/IERC7821.sol";
+import { EIP7702DeleGatorCore } from "../src/EIP7702/EIP7702DeleGatorCore.sol";
 import { BaseTest } from "./utils/BaseTest.t.sol";
-import { Delegation, Caveat, PackedUserOperation, Delegation, Execution, ModeCode } from "../src/utils/Types.sol";
+import {
+    Delegation,
+    Caveat,
+    PackedUserOperation,
+    Delegation,
+    Execution,
+    ModeCode,
+    ModePayload,
+    ExecType,
+    CallType
+} from "../src/utils/Types.sol";
+import { CALLTYPE_SINGLE, CALLTYPE_BATCH, EXECTYPE_DEFAULT, EXECTYPE_TRY, MODE_DEFAULT } from "../src/utils/Constants.sol";
 import { Implementation, SignatureType } from "./utils/Types.t.sol";
 import { Counter } from "./utils/Counter.t.sol";
 import { StorageUtilsLib } from "./utils/StorageUtilsLib.t.sol";
 import { SigningUtilsLib } from "./utils/SigningUtilsLib.t.sol";
-import { EXECUTE_SINGULAR_SIGNATURE } from "./utils/Constants.sol";
+import { EXECUTE_SIGNATURE, EXECUTE_SINGULAR_SIGNATURE } from "./utils/Constants.sol";
 import { IDeleGatorCore } from "../src/interfaces/IDeleGatorCore.sol";
 import { IDelegationManager } from "../src/interfaces/IDelegationManager.sol";
 import { DeleGatorCore } from "../src/DeleGatorCore.sol";
@@ -88,6 +101,12 @@ abstract contract DeleGatorTestSuite is BaseTest {
     event SentPrefund(address indexed sender, uint256 amount, bool success);
     event RedeemedDelegation(address indexed rootDelegator, address indexed redeemer, Delegation delegation);
 
+    /// Hook: Expect an invalid signature revert.
+    function encodeInvalidSignatureRevertReason() internal virtual returns (bytes memory);
+
+    /// Hook: Expect the revert that occurs when not called from the EntryPoint.
+    function encodeNotEntryPointRevertReason() internal virtual returns (bytes memory);
+
     ////////////////////////////// Core Functionality //////////////////////////////
 
     function test_erc165_supportsInterface() public {
@@ -97,6 +116,15 @@ abstract contract DeleGatorTestSuite is BaseTest {
         assertTrue(users.alice.deleGator.supportsInterface(type(IERC1155Receiver).interfaceId));
         assertTrue(users.alice.deleGator.supportsInterface(type(IERC721Receiver).interfaceId));
         assertTrue(users.alice.deleGator.supportsInterface(type(IDeleGatorCore).interfaceId));
+
+        if (IMPLEMENTATION == Implementation.EIP7702Stateless) {
+            assertTrue(users.alice.deleGator.supportsInterface(type(IERC7821).interfaceId));
+        }
+    }
+
+    // should allow retrieval of the delegation manager
+    function test_allow_getDelegationManager() public {
+        assertEq(address(users.alice.deleGator.delegationManager()), address(delegationManager));
     }
 
     // should allow the delegator account to receive native tokens
@@ -105,6 +133,15 @@ abstract contract DeleGatorTestSuite is BaseTest {
         (bool success_,) = address(users.alice.deleGator).call{ value: 1 ether }("");
         assertTrue(success_);
         assertEq(address(users.alice.deleGator).balance, balanceBefore_ + 1 ether);
+    }
+
+    // should allow retrieval of the domain values
+    function test_allow_getDomainValues() public {
+        (,, string memory version_, uint256 chainId_, address verifyingContract,,) = users.alice.deleGator.eip712Domain();
+
+        assertEq(version_, "1");
+        assertEq(chainId_, block.chainid);
+        assertEq(verifyingContract, address(users.alice.deleGator));
     }
 
     // should allow retrieval of the nonce
@@ -876,7 +913,8 @@ abstract contract DeleGatorTestSuite is BaseTest {
         delegations_[1] = delegation1_;
 
         vm.prank(users.carol.addr);
-        vm.expectRevert(abi.encodeWithSelector(IDelegationManager.InvalidSignature.selector));
+        bytes memory revertReason_ = encodeInvalidSignatureRevertReason();
+        vm.expectRevert(revertReason_);
 
         bytes[] memory permissionContexts_ = new bytes[](1);
         permissionContexts_[0] = abi.encode(delegations_);
@@ -1180,12 +1218,36 @@ abstract contract DeleGatorTestSuite is BaseTest {
         assertEq(finalValue_, initialValue_ + 1);
     }
 
-    // should allow Alice to execute multiple executionCallDatas_ in a single UserOp
+    // should allow Alice to execute a single execution with a single UserOp
+    function test_allow_singleExecution_UserOp() public {
+        // Get Alice's DeleGator's Counter's initial count
+        uint256 initialValue_ = aliceDeleGatorCounter.count();
+
+        // Execute Executions
+        bytes memory userOpCallData_ = abi.encodeWithSignature(
+            EXECUTE_SIGNATURE,
+            ModeLib.encode(CALLTYPE_SINGLE, EXECTYPE_DEFAULT, MODE_DEFAULT, ModePayload.wrap(0x00)),
+            ExecutionLib.encodeSingle(address(aliceDeleGatorCounter), 0, abi.encodeWithSelector(Counter.increment.selector))
+        );
+        PackedUserOperation memory userOp_ = createUserOp(address(users.alice.deleGator), userOpCallData_);
+        bytes32 userOpHash_ = getPackedUserOperationTypedDataHash(userOp_);
+        userOp_.signature = signHash(users.alice, userOpHash_);
+
+        submitUserOp_Bundler(userOp_, false);
+
+        // Get final count
+        uint256 finalValue_ = aliceDeleGatorCounter.count();
+
+        // Validate that the delegations_ were worked
+        assertEq(finalValue_, initialValue_ + 1);
+    }
+
+    // should allow Alice to execute multiple Executions in a single UserOp
     function test_allow_multiExecution_UserOp() public {
         // Get Alice's DeleGator's Counter's initial count
         uint256 initialValue_ = aliceDeleGatorCounter.count();
 
-        // Create executionCallDatas_
+        // Create Executions
         Execution[] memory executionCallDatas_ = new Execution[](2);
         executionCallDatas_[0] = Execution({
             target: address(aliceDeleGatorCounter),
@@ -1199,7 +1261,15 @@ abstract contract DeleGatorTestSuite is BaseTest {
         });
 
         // Execute Executions
-        executeBatch_UserOp(users.alice, executionCallDatas_);
+        bytes memory userOpCallData_ = abi.encodeWithSignature(
+            EXECUTE_SIGNATURE,
+            ModeLib.encode(CALLTYPE_BATCH, EXECTYPE_DEFAULT, MODE_DEFAULT, ModePayload.wrap(0x00)),
+            abi.encode(executionCallDatas_)
+        );
+        PackedUserOperation memory userOp_ = createUserOp(address(users.alice.deleGator), userOpCallData_);
+        bytes32 userOpHash_ = getPackedUserOperationTypedDataHash(userOp_);
+        userOp_.signature = signHash(users.alice, userOpHash_);
+        submitUserOp_Bundler(userOp_, false);
 
         // Get final count
         uint256 finalValue_ = aliceDeleGatorCounter.count();
@@ -1208,7 +1278,136 @@ abstract contract DeleGatorTestSuite is BaseTest {
         assertEq(finalValue_, initialValue_ + 2);
     }
 
-    // should allow Bob to execute multiple executionCallDatas_ that redeem delegations_ in a single UserOp (offchain)
+    // should allow Alice to execute a single Execution in a single UserOp that catches reverts
+    function test_allow_trySingleExecution_UserOp() public {
+        // Get Alice's DeleGator's Counter's initial count
+        uint256 initialValue_ = aliceDeleGatorCounter.count();
+
+        // Execute Executions
+        bytes memory userOpCallData_ = abi.encodeWithSignature(
+            EXECUTE_SIGNATURE,
+            ModeLib.encode(CALLTYPE_SINGLE, EXECTYPE_TRY, MODE_DEFAULT, ModePayload.wrap(0x00)),
+            ExecutionLib.encodeSingle(address(aliceDeleGatorCounter), 0, abi.encodeWithSelector(Counter.increment.selector))
+        );
+        PackedUserOperation memory userOp_ = createUserOp(address(users.alice.deleGator), userOpCallData_);
+        bytes32 userOpHash_ = getPackedUserOperationTypedDataHash(userOp_);
+        userOp_.signature = signHash(users.alice, userOpHash_);
+        submitUserOp_Bundler(userOp_, false);
+
+        // Get final count
+        uint256 finalValue_ = aliceDeleGatorCounter.count();
+
+        // Validate that the delegations_ were worked
+        assertEq(finalValue_, initialValue_ + 1);
+    }
+
+    // should allow Alice to execute multiple Executions in a single UserOp that catches reverts
+    function test_allow_tryMultiExecution_UserOp() public {
+        // Get Alice's DeleGator's Counter's initial count
+        uint256 initialValue_ = aliceDeleGatorCounter.count();
+
+        // Create Executions
+        Execution[] memory executionCallDatas_ = new Execution[](2);
+        executionCallDatas_[0] = Execution({
+            target: address(aliceDeleGatorCounter),
+            value: 0,
+            callData: abi.encodeWithSelector(Counter.increment.selector)
+        });
+        executionCallDatas_[1] = Execution({
+            target: address(aliceDeleGatorCounter),
+            value: 0,
+            callData: abi.encodeWithSelector(Counter.increment.selector)
+        });
+
+        // Execute Executions
+        bytes memory userOpCallData_ = abi.encodeWithSignature(
+            EXECUTE_SIGNATURE,
+            ModeLib.encode(CALLTYPE_BATCH, EXECTYPE_TRY, MODE_DEFAULT, ModePayload.wrap(0x00)),
+            abi.encode(executionCallDatas_)
+        );
+        PackedUserOperation memory userOp_ = createUserOp(address(users.alice.deleGator), userOpCallData_);
+        bytes32 userOpHash_ = getPackedUserOperationTypedDataHash(userOp_);
+        userOp_.signature = signHash(users.alice, userOpHash_);
+        submitUserOp_Bundler(userOp_, false);
+
+        // Get final count
+        uint256 finalValue_ = aliceDeleGatorCounter.count();
+
+        // Validate that the delegations_ were worked
+        assertEq(finalValue_, initialValue_ + 2);
+    }
+
+    // should not allow an unsupported callType
+    function test_notAllow_unsupportedCallType_UserOp() public {
+        ModeCode mode_ = ModeLib.encode(CallType.wrap(0x02), EXECTYPE_DEFAULT, MODE_DEFAULT, ModePayload.wrap(0x00));
+        // Execute Executions
+        bytes memory userOpCallData_ = abi.encodeWithSignature(
+            EXECUTE_SIGNATURE,
+            mode_,
+            ExecutionLib.encodeSingle(address(aliceDeleGatorCounter), 0, abi.encodeWithSelector(Counter.increment.selector))
+        );
+        PackedUserOperation memory userOp_ = createUserOp(address(users.alice.deleGator), userOpCallData_);
+        bytes32 userOpHash_ = getPackedUserOperationTypedDataHash(userOp_);
+        userOp_.signature = signHash(users.alice, userOpHash_);
+
+        bytes memory revertReason_ = abi.encodeWithSelector(DeleGatorCore.UnsupportedCallType.selector, CallType.wrap(0x02));
+        // Expect a revert event
+        vm.expectEmit(false, false, false, true, address(entryPoint));
+        emit UserOperationRevertReason(userOpHash_, address(users.alice.deleGator), 0, revertReason_);
+
+        submitUserOp_Bundler(userOp_, false);
+    }
+
+    // should not allow an unsupported execType
+    function test_notAllow_singleUnsupportedExecType_UserOp() public {
+        ModeCode mode_ = ModeLib.encode(CALLTYPE_SINGLE, ExecType.wrap(0x02), MODE_DEFAULT, ModePayload.wrap(0x00));
+        // Execute Executions
+        bytes memory userOpCallData_ = abi.encodeWithSignature(
+            EXECUTE_SIGNATURE,
+            mode_,
+            ExecutionLib.encodeSingle(address(aliceDeleGatorCounter), 0, abi.encodeWithSelector(Counter.increment.selector))
+        );
+        PackedUserOperation memory userOp_ = createUserOp(address(users.alice.deleGator), userOpCallData_);
+        bytes32 userOpHash_ = getPackedUserOperationTypedDataHash(userOp_);
+        userOp_.signature = signHash(users.alice, userOpHash_);
+
+        bytes memory revertReason_ = abi.encodeWithSelector(DeleGatorCore.UnsupportedExecType.selector, ExecType.wrap(0x02));
+        // Expect a revert event
+        vm.expectEmit(false, false, false, true, address(entryPoint));
+        emit UserOperationRevertReason(userOpHash_, address(users.alice.deleGator), 0, revertReason_);
+        submitUserOp_Bundler(userOp_, false);
+    }
+
+    // should not allow an unsupported execType in a batch
+    function test_notAllow_multiUnsupportedExecType_UserOp() public {
+        ModeCode mode_ = ModeLib.encode(CALLTYPE_BATCH, ExecType.wrap(0x02), MODE_DEFAULT, ModePayload.wrap(0x00));
+        // Create Executions
+        Execution[] memory executionCallDatas_ = new Execution[](2);
+        executionCallDatas_[0] = Execution({
+            target: address(aliceDeleGatorCounter),
+            value: 0,
+            callData: abi.encodeWithSelector(Counter.increment.selector)
+        });
+        executionCallDatas_[1] = Execution({
+            target: address(aliceDeleGatorCounter),
+            value: 0,
+            callData: abi.encodeWithSelector(Counter.increment.selector)
+        });
+
+        // Execute Executions
+        bytes memory userOpCallData_ = abi.encodeWithSignature(EXECUTE_SIGNATURE, mode_, abi.encode(executionCallDatas_));
+        PackedUserOperation memory userOp_ = createUserOp(address(users.alice.deleGator), userOpCallData_);
+        bytes32 userOpHash_ = getPackedUserOperationTypedDataHash(userOp_);
+        userOp_.signature = signHash(users.alice, userOpHash_);
+
+        bytes memory revertReason_ = abi.encodeWithSelector(DeleGatorCore.UnsupportedExecType.selector, ExecType.wrap(0x02));
+        // Expect a revert event
+        vm.expectEmit(false, false, false, true, address(entryPoint));
+        emit UserOperationRevertReason(userOpHash_, address(users.alice.deleGator), 0, revertReason_);
+        submitUserOp_Bundler(userOp_, false);
+    }
+
+    // should allow Bob to execute multiple Executions that redeem delegations_ in a single UserOp (offchain)
     function test_allow_multiExecutionDelegationClaim_Offchain_UserOp() public {
         // Get Alice's DeleGator's Counter's initial count
         uint256 initialValue_ = aliceDeleGatorCounter.count();
@@ -1262,7 +1461,7 @@ abstract contract DeleGatorTestSuite is BaseTest {
         assertEq(finalValue_, initialValue_ + 2);
     }
 
-    // should allow Alice to execute a combination of executionCallDatas_ through a single UserOp
+    // should allow Alice to execute a combination of Executions through a single UserOp
     function test_allow_multiExecutionCombination_UserOp() public {
         // Get DeleGator's Counter's initial count
         uint256 initialValueAlice_ = aliceDeleGatorCounter.count();
@@ -1317,6 +1516,155 @@ abstract contract DeleGatorTestSuite is BaseTest {
         assertEq(finalValueBob_, initialValueBob_ + 1);
     }
 
+    // should allow Alice to execute a single Executions in a single UserOp
+    function test_allow_executeFromExecutor() public {
+        // Get Alice's DeleGator's Counter's initial count
+        uint256 initialValue_ = aliceDeleGatorCounter.count();
+
+        // Execute Execution
+        vm.prank(address(delegationManager));
+        users.alice.deleGator.executeFromExecutor(
+            ModeLib.encode(CALLTYPE_SINGLE, EXECTYPE_DEFAULT, MODE_DEFAULT, ModePayload.wrap(0x00)),
+            ExecutionLib.encodeSingle(address(aliceDeleGatorCounter), 0, abi.encodeWithSelector(Counter.increment.selector))
+        );
+
+        // Get final count
+        uint256 finalValue_ = aliceDeleGatorCounter.count();
+
+        // Validate that the delegations_ were worked
+        assertEq(finalValue_, initialValue_ + 1);
+    }
+
+    // should allow Alice to execute a single Executions in a single UserOp
+    function test_allow_executeFromExecutor_batch() public {
+        // Get Alice's DeleGator's Counter's initial count
+        uint256 initialValue_ = aliceDeleGatorCounter.count();
+
+        // Execute Execution
+        Execution[] memory executions_ = new Execution[](2);
+        executions_[0] = Execution({
+            target: address(aliceDeleGatorCounter),
+            value: 0,
+            callData: abi.encodeWithSelector(Counter.increment.selector)
+        });
+        executions_[1] = Execution({
+            target: address(aliceDeleGatorCounter),
+            value: 0,
+            callData: abi.encodeWithSelector(Counter.increment.selector)
+        });
+        vm.prank(address(delegationManager));
+        users.alice.deleGator.executeFromExecutor(
+            ModeLib.encode(CALLTYPE_BATCH, EXECTYPE_DEFAULT, MODE_DEFAULT, ModePayload.wrap(0x00)),
+            ExecutionLib.encodeBatch(executions_)
+        );
+
+        // Get final count
+        uint256 finalValue_ = aliceDeleGatorCounter.count();
+
+        // Validate that the delegations_ were worked
+        assertEq(finalValue_, initialValue_ + 2);
+    }
+
+    // should allow Alice to execute a single Executions in a single UserOp
+    function test_allow_tryExecuteFromExecutor() public {
+        // Get Alice's DeleGator's Counter's initial count
+        uint256 initialValue_ = aliceDeleGatorCounter.count();
+
+        // Execute Execution
+        vm.prank(address(delegationManager));
+        users.alice.deleGator.executeFromExecutor(
+            ModeLib.encode(CALLTYPE_SINGLE, EXECTYPE_TRY, MODE_DEFAULT, ModePayload.wrap(0x00)),
+            ExecutionLib.encodeSingle(address(aliceDeleGatorCounter), 0, abi.encodeWithSelector(Counter.increment.selector))
+        );
+
+        // Get final count
+        uint256 finalValue_ = aliceDeleGatorCounter.count();
+
+        // Validate that the delegations_ were worked
+        assertEq(finalValue_, initialValue_ + 1);
+    }
+
+    // should allow Alice to execute a single Executions in a single UserOp
+    function test_allow_tryExecuteFromExecutor_batch() public {
+        // Get Alice's DeleGator's Counter's initial count
+        uint256 initialValue_ = aliceDeleGatorCounter.count();
+
+        // Execute Execution
+        Execution[] memory executions_ = new Execution[](2);
+        executions_[0] = Execution({
+            target: address(aliceDeleGatorCounter),
+            value: 0,
+            callData: abi.encodeWithSelector(Counter.increment.selector)
+        });
+        executions_[1] = Execution({
+            target: address(aliceDeleGatorCounter),
+            value: 0,
+            callData: abi.encodeWithSelector(Counter.increment.selector)
+        });
+        vm.prank(address(delegationManager));
+        users.alice.deleGator.executeFromExecutor(
+            ModeLib.encode(CALLTYPE_BATCH, EXECTYPE_TRY, MODE_DEFAULT, ModePayload.wrap(0x00)),
+            ExecutionLib.encodeBatch(executions_)
+        );
+
+        // Get final count
+        uint256 finalValue_ = aliceDeleGatorCounter.count();
+
+        // Validate that the delegations_ were worked
+        assertEq(finalValue_, initialValue_ + 2);
+    }
+
+    // should allow Alice to execute a single Executions in a single UserOp
+    function test_allow_executeFromExecutorUnsupportedExecType() public {
+        ModeCode mode_ = ModeLib.encode(CALLTYPE_SINGLE, ExecType.wrap(0x02), MODE_DEFAULT, ModePayload.wrap(0x00));
+
+        bytes memory revertReason_ = abi.encodeWithSelector(DeleGatorCore.UnsupportedExecType.selector, ExecType.wrap(0x02));
+        vm.expectRevert(revertReason_);
+
+        // Execute Execution
+        vm.prank(address(delegationManager));
+        users.alice.deleGator.executeFromExecutor(
+            mode_, ExecutionLib.encodeSingle(address(aliceDeleGatorCounter), 0, abi.encodeWithSelector(Counter.increment.selector))
+        );
+    }
+
+    // should allow Alice to execute a single Executions in a single UserOp
+    function test_notAllow_executeFromExecutorUnsupportedExecType_batch() public {
+        ModeCode mode_ = ModeLib.encode(CALLTYPE_BATCH, ExecType.wrap(0x02), MODE_DEFAULT, ModePayload.wrap(0x00));
+        // Execute Execution
+        Execution[] memory executions_ = new Execution[](2);
+        executions_[0] = Execution({
+            target: address(aliceDeleGatorCounter),
+            value: 0,
+            callData: abi.encodeWithSelector(Counter.increment.selector)
+        });
+        executions_[1] = Execution({
+            target: address(aliceDeleGatorCounter),
+            value: 0,
+            callData: abi.encodeWithSelector(Counter.increment.selector)
+        });
+
+        bytes memory revertReason_ = abi.encodeWithSelector(DeleGatorCore.UnsupportedExecType.selector, ExecType.wrap(0x02));
+        vm.expectRevert(revertReason_);
+
+        vm.prank(address(delegationManager));
+        users.alice.deleGator.executeFromExecutor(mode_, ExecutionLib.encodeBatch(executions_));
+    }
+
+    // should allow Alice to execute a single Executions in a single UserOp
+    function test_notAllow_executeFromExecutorUnsupportedCallType() public {
+        ModeCode mode_ = ModeLib.encode(CallType.wrap(0x02), EXECTYPE_TRY, MODE_DEFAULT, ModePayload.wrap(0x00));
+
+        bytes memory revertReason_ = abi.encodeWithSelector(DeleGatorCore.UnsupportedCallType.selector, CallType.wrap(0x02));
+        vm.expectRevert(revertReason_);
+
+        // Execute Execution
+        vm.prank(address(delegationManager));
+        users.alice.deleGator.executeFromExecutor(
+            mode_, ExecutionLib.encodeSingle(address(aliceDeleGatorCounter), 0, abi.encodeWithSelector(Counter.increment.selector))
+        );
+    }
+
     ////////////////////////////// Invalid cases //////////////////////////////
 
     // should not allow a second Execution to execute if the first Execution fails
@@ -1325,7 +1673,7 @@ abstract contract DeleGatorTestSuite is BaseTest {
         uint256 initialValueAlice_ = aliceDeleGatorCounter.count();
         uint256 initialValueBob_ = bobDeleGatorCounter.count();
 
-        // Create executionCallDatas_, incorrectly incrementing Bob's Counter first
+        // Create Executions, incorrectly incrementing Bob's Counter first
         Execution[] memory executionCallDatas_ = new Execution[](2);
         executionCallDatas_[0] = Execution({
             target: address(bobDeleGatorCounter),
@@ -1338,7 +1686,7 @@ abstract contract DeleGatorTestSuite is BaseTest {
             callData: abi.encodeWithSelector(Counter.increment.selector)
         });
 
-        // Execute executionCallDatas_
+        // Execute Executions
         executeBatch_UserOp(users.alice, executionCallDatas_);
 
         // Get final count
@@ -1438,7 +1786,7 @@ abstract contract DeleGatorTestSuite is BaseTest {
 
         // Create Alice's UserOp (with invalid EntryPoint)
         userOp_ = createUserOp(address(users.alice.deleGator), userOpCallData_);
-        userOp_ = signUserOp(users.alice, userOp_, newEntryPoint_);
+        userOp_ = signUserOp(users.alice, userOp_);
 
         // Submit the UserOp through the Bundler
         vm.prank(bundler);
@@ -1730,7 +2078,10 @@ abstract contract DeleGatorTestSuite is BaseTest {
         vm.expectEmit(true, true, false, true, address(entryPoint));
         // expect an event containing InvalidSignature error
         emit UserOperationRevertReason(
-            userOpHash_, address(users.bob.deleGator), 0, abi.encodeWithSelector(IDelegationManager.InvalidSignature.selector)
+            userOpHash_,
+            address(users.bob.deleGator),
+            0,
+            abi.encodeWithSelector(IDelegationManager.InvalidERC1271Signature.selector)
         );
 
         entryPoint.handleOps(userOps_, bundler);
@@ -1783,7 +2134,10 @@ abstract contract DeleGatorTestSuite is BaseTest {
         vm.expectEmit(true, true, false, true, address(entryPoint));
         // expect an event containing InvalidDelegationSignature error
         emit UserOperationRevertReason(
-            userOpHash_, address(users.bob.deleGator), 0, abi.encodeWithSelector(IDelegationManager.InvalidSignature.selector)
+            userOpHash_,
+            address(users.bob.deleGator),
+            0,
+            abi.encodeWithSelector(IDelegationManager.InvalidERC1271Signature.selector)
         );
 
         entryPoint.handleOps(userOps_, bundler);
@@ -1810,7 +2164,8 @@ abstract contract DeleGatorTestSuite is BaseTest {
             value: 0,
             callData: abi.encodeWithSelector(Counter.increment.selector)
         });
-        vm.expectRevert(abi.encodeWithSelector(DeleGatorCore.NotEntryPoint.selector));
+        bytes memory revertReason_ = encodeNotEntryPointRevertReason();
+        vm.expectRevert(revertReason_);
         users.alice.deleGator.execute(execution_);
     }
 
@@ -1889,23 +2244,50 @@ abstract contract DeleGatorTestSuite is BaseTest {
     }
 }
 
-contract HybridDeleGator_TestSuite_P256_Test is DeleGatorTestSuite {
+abstract contract UUPSDeleGatorTest is DeleGatorTestSuite {
+    function encodeInvalidSignatureRevertReason() internal pure override returns (bytes memory) {
+        return abi.encodeWithSelector(IDelegationManager.InvalidEOASignature.selector);
+    }
+
+    function encodeNotEntryPointRevertReason() internal pure override returns (bytes memory) {
+        return abi.encodeWithSelector(DeleGatorCore.NotEntryPoint.selector);
+    }
+}
+
+abstract contract EIP7702DeleGatorTest is DeleGatorTestSuite {
+    function encodeInvalidSignatureRevertReason() internal pure override returns (bytes memory) {
+        return abi.encodeWithSelector(IDelegationManager.InvalidERC1271Signature.selector);
+    }
+
+    function encodeNotEntryPointRevertReason() internal pure override returns (bytes memory) {
+        return abi.encodeWithSelector(DeleGatorCore.NotEntryPointOrSelf.selector);
+    }
+}
+
+contract HybridDeleGator_TestSuite_P256_Test is UUPSDeleGatorTest {
     constructor() {
         IMPLEMENTATION = Implementation.Hybrid;
         SIGNATURE_TYPE = SignatureType.RawP256;
     }
 }
 
-contract HybridDeleGator_TestSuite_EOA_Test is DeleGatorTestSuite {
+contract HybridDeleGator_TestSuite_EOA_Test is UUPSDeleGatorTest {
     constructor() {
         IMPLEMENTATION = Implementation.Hybrid;
         SIGNATURE_TYPE = SignatureType.EOA;
     }
 }
 
-contract MultiSig_TestSuite_Test is DeleGatorTestSuite {
+contract MultiSig_TestSuite_Test is UUPSDeleGatorTest {
     constructor() {
         IMPLEMENTATION = Implementation.MultiSig;
         SIGNATURE_TYPE = SignatureType.MultiSig;
+    }
+}
+
+contract EIP7702Staless_TestSuite_Test is EIP7702DeleGatorTest {
+    constructor() {
+        IMPLEMENTATION = Implementation.EIP7702Stateless;
+        SIGNATURE_TYPE = SignatureType.EOA;
     }
 }
