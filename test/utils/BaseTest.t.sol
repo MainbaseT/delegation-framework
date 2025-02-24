@@ -6,26 +6,31 @@ import { Vm } from "forge-std/Vm.sol";
 import { StdCheatsSafe } from "forge-std/StdCheats.sol";
 import { EntryPoint } from "@account-abstraction/core/EntryPoint.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import { FCL_ecdsa_utils } from "@freshCryptoLib/FCL_ecdsa_utils.sol";
+import { FCL_ecdsa_utils } from "@FCL/FCL_ecdsa_utils.sol";
+import { ecGenMulmuladdB4W } from "@SCL/elliptic/SCL_mulmuladdX_fullgenW.sol";
+import { a, b, p, gx, gy, n } from "@SCL/fields/SCL_secp256r1.sol";
 import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import { IEntryPoint } from "@account-abstraction/core/EntryPoint.sol";
 import { ModeLib } from "@erc7579/lib/ModeLib.sol";
 import { ExecutionLib } from "@erc7579/lib/ExecutionLib.sol";
 
-import { P256FCLVerifierLib } from "../../src/libraries/P256FCLVerifierLib.sol";
-import { FCL_all_wrapper } from "./FCLWrapperLib.sol";
+import { P256SCLVerifierLib } from "../../src/libraries/P256SCLVerifierLib.sol";
+import { SCL_Wrapper } from "./SCLWrapperLib.sol";
 
 import { EXECUTE_SIGNATURE } from "./Constants.sol";
 import { EncoderLib } from "../../src/libraries/EncoderLib.sol";
 import { TestUser, TestUsers, Implementation, SignatureType } from "./Types.t.sol";
 import { SigningUtilsLib } from "./SigningUtilsLib.t.sol";
 import { StorageUtilsLib } from "./StorageUtilsLib.t.sol";
+import { UserOperationLib } from "./UserOperationLib.t.sol";
 import { Execution, PackedUserOperation, Delegation, ModeCode } from "../../src/utils/Types.sol";
 import { SimpleFactory } from "../../src/utils/SimpleFactory.sol";
 import { DelegationManager } from "../../src/DelegationManager.sol";
 import { DeleGatorCore } from "../../src/DeleGatorCore.sol";
 import { HybridDeleGator } from "../../src/HybridDeleGator.sol";
 import { MultiSigDeleGator } from "../../src/MultiSigDeleGator.sol";
+import { EIP7702StatelessDeleGator } from "../../src/EIP7702/EIP7702StatelessDeleGator.sol";
+import "forge-std/Test.sol";
 
 abstract contract BaseTest is Test {
     using ModeLib for ModeCode;
@@ -52,6 +57,7 @@ abstract contract BaseTest is Test {
     // DeleGator Implementations
     HybridDeleGator public hybridDeleGatorImpl;
     MultiSigDeleGator public multiSigDeleGatorImpl;
+    EIP7702StatelessDeleGator public eip7702StatelessDeleGatorImpl;
 
     // Users
     TestUsers internal users;
@@ -80,8 +86,8 @@ abstract contract BaseTest is Test {
         ANY_DELEGATE = delegationManager.ANY_DELEGATE();
 
         // Create P256 Verifier Contract
-        vm.etch(P256FCLVerifierLib.VERIFIER, type(FCL_all_wrapper).runtimeCode);
-        vm.label(P256FCLVerifierLib.VERIFIER, "P256 Verifier");
+        vm.etch(P256SCLVerifierLib.VERIFIER, type(SCL_Wrapper).runtimeCode);
+        vm.label(P256SCLVerifierLib.VERIFIER, "P256 Verifier");
 
         // Deploy the implementations
         hybridDeleGatorImpl = new HybridDeleGator(delegationManager, entryPoint);
@@ -89,6 +95,9 @@ abstract contract BaseTest is Test {
 
         multiSigDeleGatorImpl = new MultiSigDeleGator(delegationManager, entryPoint);
         vm.label(address(multiSigDeleGatorImpl), "MultiSig DeleGator");
+
+        eip7702StatelessDeleGatorImpl = new EIP7702StatelessDeleGator(delegationManager, entryPoint);
+        vm.label(address(eip7702StatelessDeleGatorImpl), "EIP7702Stateless DeleGator");
 
         // Create users
         users = _createUsers();
@@ -213,6 +222,14 @@ abstract contract BaseTest is Test {
         return createUserOp(_sender, _callData, _initCode, accountGasLimits_, 30000000, gasFees_, _paymasterAndData, hex"");
     }
 
+    // NOTE: This is a big assumption about how signatures for DeleGators are made. The hash to sign could come in many forms
+    // depending on the implementation.
+    function getPackedUserOperationTypedDataHash(PackedUserOperation memory _userOp) public view returns (bytes32) {
+        return HybridDeleGator(payable(_userOp.sender)).getPackedUserOperationTypedDataHash(_userOp);
+    }
+
+    // NOTE: This method assumes the signature is an EIP712 signature of the UserOperation with a domain provided by the Signer. It
+    // expects the hash to be signed to be returned by the method `getPackedUserOperationTypedDataHash`.
     function signUserOp(
         TestUser memory _user,
         PackedUserOperation memory _userOp
@@ -221,20 +238,7 @@ abstract contract BaseTest is Test {
         view
         returns (PackedUserOperation memory)
     {
-        return signUserOp(_user, _userOp, entryPoint);
-    }
-
-    function signUserOp(
-        TestUser memory _user,
-        PackedUserOperation memory _userOp,
-        IEntryPoint _entryPoint
-    )
-        public
-        view
-        returns (PackedUserOperation memory)
-    {
-        bytes32 userOpHash_ = _entryPoint.getUserOpHash(_userOp);
-        _userOp.signature = signHash(_user, userOpHash_.toEthSignedMessageHash());
+        _userOp.signature = signHash(_user, getPackedUserOperationTypedDataHash(_userOp));
         return _userOp;
     }
 
@@ -298,11 +302,13 @@ abstract contract BaseTest is Test {
             ExecutionLib.encodeSingle(_execution.target, _execution.value, _execution.callData)
         );
         PackedUserOperation memory userOp_ = createUserOp(address(_user.deleGator), userOpCallData_, hex"", _paymasterAndData);
-        bytes32 userOpHash_ = entryPoint.getUserOpHash(userOp_);
-        userOp_.signature = signHash(_user, userOpHash_.toEthSignedMessageHash());
+        userOp_.signature = signHash(_user, getPackedUserOperationTypedDataHash(userOp_));
         submitUserOp_Bundler(userOp_, _shouldFail);
     }
 
+    /**
+     * @dev Executes the calldata on self.
+     */
     function execute_UserOp(TestUser memory _user, bytes memory _callData) public {
         Execution memory execution_ = Execution({ target: address(_user.deleGator), value: 0, callData: _callData });
         execute_UserOp(_user, execution_);
@@ -312,8 +318,7 @@ abstract contract BaseTest is Test {
         bytes memory userOpCallData_ =
             abi.encodeWithSignature(EXECUTE_SIGNATURE, ModeLib.encodeSimpleBatch(), abi.encode(_executions));
         PackedUserOperation memory userOp_ = createUserOp(address(_user.deleGator), userOpCallData_);
-        bytes32 userOpHash_ = entryPoint.getUserOpHash(userOp_);
-        userOp_.signature = signHash(_user, userOpHash_.toEthSignedMessageHash());
+        userOp_.signature = signHash(_user, getPackedUserOperationTypedDataHash(userOp_));
         submitUserOp_Bundler(userOp_, false);
     }
 
@@ -341,8 +346,7 @@ abstract contract BaseTest is Test {
         bytes memory userOpCallData_ =
             abi.encodeWithSelector(DeleGatorCore.redeemDelegations.selector, permissionContexts_, modes_, executionCallDatas_);
         PackedUserOperation memory userOp_ = createUserOp(address(_user.deleGator), userOpCallData_, _initCode);
-        bytes32 userOpHash_ = entryPoint.getUserOpHash(userOp_);
-        userOp_.signature = signHash(_user, userOpHash_.toEthSignedMessageHash());
+        userOp_.signature = signHash(_user, getPackedUserOperationTypedDataHash(userOp_));
         submitUserOp_Bundler(userOp_, false);
     }
 
@@ -367,6 +371,8 @@ abstract contract BaseTest is Test {
             return deployDeleGator_Hybrid(_user);
         } else if (_implementation == Implementation.MultiSig) {
             return deployDeleGator_MultiSig(_user);
+        } else if (_implementation == Implementation.EIP7702Stateless) {
+            return deployDeleGator_EIP7702Stateless(_user);
         } else {
             revert("Invalid Implementation");
         }
@@ -413,6 +419,15 @@ abstract contract BaseTest is Test {
         );
     }
 
+    function deployDeleGator_EIP7702Stateless(TestUser memory _user) public returns (address) {
+        return deployDeleGator_EIP7702Stateless(_user.addr);
+    }
+
+    function deployDeleGator_EIP7702Stateless(address _eoaAddress) public returns (address) {
+        vm.etch(_eoaAddress, bytes.concat(hex"ef0100", abi.encodePacked(eip7702StatelessDeleGatorImpl)));
+        return _eoaAddress;
+    }
+
     // Name is the seed used to generate the address, private key, and DeleGator.
     function createUser(string memory _name) public returns (TestUser memory user_) {
         (address addr_, uint256 privateKey_) = makeAddrAndKey(_name);
@@ -429,9 +444,9 @@ abstract contract BaseTest is Test {
         vm.label(address(user_.deleGator), string.concat(_name, " DeleGator"));
     }
 
-    ////////////////////////////// Private //////////////////////////////
+    ////////////////////////////// Internal //////////////////////////////
 
-    function _createUsers() private returns (TestUsers memory users_) {
+    function _createUsers() internal returns (TestUsers memory users_) {
         users_.alice = createUser("Alice");
         users_.bob = createUser("Bob");
         users_.carol = createUser("Carol");
